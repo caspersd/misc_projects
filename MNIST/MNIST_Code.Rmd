@@ -1,0 +1,361 @@
+---
+author: "David Caspers"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(cluster)
+library(tidyr)
+library(caret)
+library(dplyr)
+library(rpart)
+library(naivebayes)
+library(randomForest)
+library(doMC)
+
+# Detect the number of cores available
+cores = detectCores() - 1
+
+# Register the parallel backend with the specified number of cores
+registerDoMC(cores = cores)
+```
+
+# Introduction
+
+## Data Preparation
+
+Loading CSV
+```{r}
+file_path = "/Users/davidcaspers/Downloads/digit_recognizer_train.csv"
+df_train = read.csv(file_path)
+
+file_path = "/Users/davidcaspers/Downloads/test.csv"
+df_test = read.csv(file_path)
+```
+
+```{r}
+View(df_train)
+#check if any row is NA
+sum(is.na(df_train))
+
+#transform label into factor
+df_train = df_train %>% mutate(label = as.factor(label))
+```
+
+
+```{r}
+# Define a sequence of minbucket values to test
+minbucket_values = seq(5, 25, by = 5)
+
+#define tune grid for the complexity parameter (controls depth of split)
+tune_grid = expand.grid(
+  cp = seq(0, 0.2, by=0.05)
+)
+
+#Define a cross fold validation of 3 folds
+train_control = trainControl(method="cv", number=3, summaryFunction = multiClassSummary, savePredictions = "final")
+
+
+#instantiate list to store models in
+tree_tune_results_df = data.frame(accuracy= integer(), minbucket=integer(),num_nodes = integer(), num_leaves=integer(),tuned_cp=numeric())
+final_models = list()
+
+for (minbucket in minbucket_values){
+  
+  model = train(
+    label~.,
+    data=df_train,
+    method="rpart",
+    trControl=train_control,
+    tuneGrid=tune_grid,
+    control = rpart.control(minbucket=minbucket)
+    )
+  
+  tree_tune_results_df = rbind(tree_tune_results_df, data.frame(
+    minbucket=minbucket, 
+    accuracy = mean(model$resample$Accuracy),
+    num_nodes = nrow(model$finalModel$frame),
+    num_leaves = sum(model$finalModel$frame$var == "<leaf>"),
+    tuned_cp = model$bestTune[,'cp']
+  ))
+  final_models[[paste("minbucket", minbucket, sep = "_")]] = model
+}
+
+best_model_out_of_fold_preds = final_models[[1]]$pred
+dt_conf_matrix = confusionMatrix(best_model_out_of_fold_preds$pred, best_model_out_of_fold_preds$obs)
+dt_conf_matrix
+```
+
+
+Gaussian niave bayes assumes normally distributed varaibles -- randomly sampling a few pixels to see if this is the case
+```{r}
+# Sample 16 random pixels
+sampled_pixels = sample(1:784, 16)
+
+# Subset the data to include only the sampled pixels and the label
+df_subset = df_train[, c("label", paste0("pixel", sampled_pixels))]
+
+# Convert the data to long format
+df_long = tidyr::pivot_longer(df_subset, cols = starts_with("pixel"), 
+                               names_to = "pixel", values_to = "value")
+# Create the facet-wrapped plot
+ggplot(df_long, aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ pixel, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  labs(x = "Pixel Value", y = "Frequency") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + theme_light()
+
+ggsave("pixel_histograms_large.png", width = 10, height = 16)
+
+```
+```{r}
+df_train %>% ggplot(aes(x=label,fill=label)) + geom_bar() +ggtitle("Distribution of Number Labels Across Dataset") +theme_gray()
+
+
+# reshaping a single digit's pixel data into a 28x28 matrix
+plot_digit = function(pixel_data) {
+  # Reshape the pixel vector into a 28x28 matrix
+  digit_matrix = matrix(as.numeric(pixel_data), nrow = 28, ncol = 28, byrow = TRUE)
+  
+  # Convert the matrix to a data frame for ggplot
+  digit_df = data.frame(
+    x = rep(1:28, each = 28),
+    y = rep(28:1, 28),  # Reverse y to flip the image correctly
+    fill = as.vector(digit_matrix)
+  )
+}
+library(gridExtra)
+
+# Function to reshape and plot a single digit
+plot_digit = function(pixel_data, digit_label) {
+  digit_matrix = matrix(as.numeric(pixel_data), nrow = 28, ncol = 28, byrow = TRUE)
+  
+  digit_df = data.frame(
+    x = rep(1:28, each = 28),
+    y = rep(28:1, 28),
+    fill = as.vector(digit_matrix)
+  )
+  
+  ggplot(digit_df, aes(x = x, y = y, fill = fill)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "black") +
+    theme_void() +
+    theme(legend.position = "none") +
+    ggtitle(paste("Digit:", digit_label))
+}
+  
+# List to store plots
+plots = list()
+
+# Loop through digits 0 to 9 and plot one example of each
+for (digit in 0:9) {
+  example = df_train[df_train$label == digit, -1][1, ]  # Filter the first example of each digit
+  plots[[digit + 1]] = plot_digit(example, digit)
+}
+
+# Arrange all plots in a grid
+grid.arrange(grobs = plots, ncol = 5)
+```
+
+
+Calculate the Naive Bayes
+```{r}
+train_control_MNB = trainControl(method = "cv", number = 3, summaryFunction = multiClassSummary, savePredictions = "final")
+
+guassian_model = train(
+  label ~ ., 
+  data = df_train, 
+  method = "naive_bayes",  
+  trControl = train_control_MNB,
+  tuneGrid = expand.grid(laplace = 1, usekernel = FALSE, adjust=1)
+)
+
+
+#view confusion matrix of out-of-fold predictions
+gnm_out_of_fold_preds = guassian_model$pred
+guassian_conf_matrix = confusionMatrix(gnm_out_of_fold_preds$pred, gnm_out_of_fold_preds$obs)
+guassian_conf_matrix
+
+#view model statistics
+summary(guassian_model$resample)
+
+```
+
+
+
+Retrain using kernal density to estimate the class conditional densities of pixal values
+```{r}
+kernal_model = train(
+  label ~ ., 
+  data = df_train, 
+  method = "naive_bayes",  # Use the Naive Bayes method
+  trControl = train_control_MNB,
+  tuneGrid = expand.grid(laplace = 1, usekernel = TRUE, adjust=1)
+)
+
+#view model statistics
+summary(kernal_model$resample)
+
+#view confusion matrix of out-of-fold predictions
+knb_out_of_fold_preds = kernal_model$pred
+kernal_conf_matrix = confusionMatrix(knb_out_of_fold_preds$pred, knb_out_of_fold_preds$obs)
+kernal_conf_matrix
+
+```
+
+
+Random Forest Model:
+
+```{r}
+
+train_control_rf = trainControl(method = "cv", number = 3, summaryFunction = multiClassSummary, savePredictions = "final")
+rf_model = train(
+  label ~ ., 
+  data = df_train, 
+  method = "rf",  # Use random forest
+  trControl = train_control_rf
+)
+
+#view model statistics
+summary(rf_model$resample)
+
+#plot model performance
+plot(rf_model)
+
+#view confusion matrix of out-of-fold predictions
+rf_out_of_fold_preds = rf_model$pred
+rf_conf_matrix = confusionMatrix(rf_out_of_fold_preds$pred, rf_out_of_fold_preds$obs)
+rf_conf_matrix
+rf_model$bestTune
+```
+calculate principal component analysis 
+```{r}
+# Perform PCA using prcomp
+pca_result = df_train %>% select(-label) %>% prcomp(center = TRUE)
+
+# Get the explained variance for each component
+explained_variance = pca_result$sdev^2 / sum(pca_result$sdev^2)
+
+# Calculate cumulative explained variance
+cumulative_variance = cumsum(explained_variance)
+
+# Find the number of components required to retain 95% variance
+num_components = which(cumulative_variance >= 0.95)[1]
+
+cat("Number of principal components to retain 95% variance:", num_components)
+```
+
+
+KNN Model:
+
+```{r}
+# Define train control for KNN
+train_control_knn = trainControl(
+  method = "cv",
+  number = 3,  # 3-fold cross-validation
+  summaryFunction = multiClassSummary,
+  savePredictions = "final"
+)
+
+
+# Train KNN model with preprocessing included directly in the train function
+knn_model = train(
+  label ~ ., 
+  data = df_train, 
+  method = "knn",  # Use KNN
+  trControl = train_control_knn,
+  preProcess = c("zv","center", "pca"),  # remove zero variance columns, center, and apply PCA
+  tuneLength = 2  # Number of neighbors to try
+)
+
+# View model statistics
+print(knn_model)
+
+# Plot model performance
+plot(knn_model)
+
+# View confusion matrix of out-of-fold predictions
+knn_out_of_fold_preds = knn_model$pred
+knn_conf_matrix = confusionMatrix(knn_out_of_fold_preds$pred, knn_out_of_fold_preds$obs)
+knn_conf_matrix
+
+```
+
+## SVM -- Linear Model
+
+```{r}
+# Define train control for SVM with linear kernel
+train_control_svm = trainControl(
+  method = "cv",
+  number = 2,  # 2-fold cross-validation
+  summaryFunction = multiClassSummary,
+  savePredictions = "final"
+)
+
+tune_grid = expand.grid(C = c(0.1, 1, 10))
+
+# Train SVM model with linear kernel and preprocessing included directly in the train function
+svm_model = train(
+  label ~ ., 
+  data = df_train, 
+  method = "svmLinear",  # Use SVM with linear kernel
+  trControl = train_control_svm,
+  preProcess = c("zv","center", "pca"),  # Apply centering and PCA
+  tuneGrid = tune_grid  # Number of cost values to try
+)
+
+# View model statistics
+print(svm_model)
+
+# Plot model performance
+plot(svm_model)
+
+# View confusion matrix of out-of-fold predictions
+svm_out_of_fold_preds = svm_model$pred
+svm_conf_matrix = confusionMatrix(svm_out_of_fold_preds$pred, svm_out_of_fold_preds$obs)
+svm_conf_matrix
+```
+SVM Polynomial Model
+```{r}
+# Define train control for SVM with polynomial kernel
+train_control_svm_poly = trainControl(
+  method = "cv",
+  number = 2,  # 2-fold cross-validation
+  summaryFunction = multiClassSummary,
+  savePredictions = "final"
+)
+
+# Calculate the number of features in the training data (excluding the label column)
+num_features = ncol(df_train) - 1  # Subtract 1 for the label column
+
+# Calculate the scale value as 1 / number of features
+scale_value = 1 / num_features
+
+tune_grid_svm_poly = expand.grid(C = c(0.1, 1, 10), degree = c(2, 3, 4), scale=scale_value)  # Only tuning C and degree, not scale
+
+# Train SVM model with polynomial kernel and preprocessing included directly in the train function
+svm_poly_model = train(
+  label ~ ., 
+  data = df_train, 
+  method = "svmPoly",  # Use SVM with polynomial kernel
+  trControl = train_control_svm_poly,
+  preProcess = c("zv", "center", "pca"),  # Apply centering and PCA
+  tuneGrid = tune_grid_svm_poly  
+)
+
+# View model statistics
+print(svm_poly_model)
+
+# Plot model performance
+plot(svm_poly_model)
+
+svm_poly_model$bestTune
+# View confusion matrix of out-of-fold predictions
+svm_poly_out_of_fold_preds = svm_poly_model$pred
+svm_conf_matrix = confusionMatrix(svm_poly_out_of_fold_preds$pred, svm_poly_out_of_fold_preds$obs)
+print(svm_conf_matrix)
+```
+
